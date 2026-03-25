@@ -1,0 +1,108 @@
+{
+    "name": "pl_smartdata_master",
+    "properties": {
+        "description": "Pipeline maestro: Bronze -> Silver -> Gold (Panorama Macroeconomico)",
+        "activities": [
+            {
+                "name": "Bronze_BCRP",
+                "type": "DatabricksNotebook",
+                "dependsOn": [],
+                "typeProperties": {
+                    "notebookPath": "/smartdata/${environment}/bronze/01_ingest_bcrp"
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls-databricks-etl",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "Bronze_WorldBank",
+                "type": "DatabricksNotebook",
+                "dependsOn": [],
+                "typeProperties": {
+                    "notebookPath": "/smartdata/${environment}/bronze/02_ingest_worldbank"
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls-databricks-etl",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "Bronze_Comtrade",
+                "type": "DatabricksNotebook",
+                "dependsOn": [],
+                "typeProperties": {
+                    "notebookPath": "/smartdata/${environment}/bronze/03_ingest_comtrade"
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls-databricks-etl",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "Silver_Economic",
+                "type": "DatabricksNotebook",
+                "dependsOn": [
+                    {"activity": "Bronze_BCRP", "dependencyConditions": ["Succeeded"]},
+                    {"activity": "Bronze_WorldBank", "dependencyConditions": ["Succeeded"]}
+                ],
+                "typeProperties": {
+                    "notebookPath": "/smartdata/${environment}/silver/01_clean_economic"
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls-databricks-etl",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "Silver_Trade",
+                "type": "DatabricksNotebook",
+                "dependsOn": [
+                    {"activity": "Bronze_Comtrade", "dependencyConditions": ["Succeeded"]}
+                ],
+                "typeProperties": {
+                    "notebookPath": "/smartdata/${environment}/silver/02_clean_trade"
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls-databricks-etl",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "Gold_Dimensions",
+                "type": "DatabricksNotebook",
+                "dependsOn": [
+                    {"activity": "Silver_Economic", "dependencyConditions": ["Succeeded"]},
+                    {"activity": "Silver_Trade", "dependencyConditions": ["Succeeded"]}
+                ],
+                "typeProperties": {
+                    "notebookPath": "/smartdata/${environment}/gold/01_dim_tables"
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls-databricks-etl",
+                    "type": "LinkedServiceReference"
+                }
+            },
+            {
+                "name": "Gold_Facts",
+                "type": "DatabricksNotebook",
+                "dependsOn": [
+                    {"activity": "Gold_Dimensions", "dependencyConditions": ["Succeeded"]}
+                ],
+                "typeProperties": {
+                    "notebookPath": "/smartdata/${environment}/gold/02_fact_tables"
+                },
+                "linkedServiceName": {
+                    "referenceName": "ls-databricks-etl",
+                    "type": "LinkedServiceReference"
+                }
+            }
+        ],
+        "parameters": {
+            "environment": {
+                "type": "String",
+                "defaultValue": "dev"
+            }
+        }
+    }
+}

@@ -1,0 +1,184 @@
+# =============================================================================
+# DATASETS CONFIGURATION - Partial Smart Data
+# Dashboard: Panorama Macroeconomico (BCRP + World Bank + Comtrade)
+# =============================================================================
+
+datasets:
+  # -------------------------------------------------------------------------
+  # 1. INDICADORES ECONOMICOS - Banco Central de Reserva del Peru (BCRP)
+  # -------------------------------------------------------------------------
+  bcrp_economic:
+    name: "Indicadores Economicos BCRP"
+    source: "Banco Central de Reserva del Peru"
+    base_url: "https://estadisticas.bcrp.gob.pe/estadisticas/series/api"
+    format: "json"
+    frequency: "monthly"
+    description: "Principales indicadores macroeconomicos de Peru"
+    series:
+      - id: "PN01288PM"
+        name: "PBI Global (var % 12 meses)"
+        category: "produccion"
+      - id: "PN01270PM"
+        name: "Indice de Precios al Consumidor Lima (var % mensual)"
+        category: "precios"
+      - id: "PD04638PD"
+        name: "Tipo de Cambio Venta (S/ por US$)"
+        category: "tipo_cambio"
+      - id: "PD04639PD"
+        name: "Tipo de Cambio Compra (S/ por US$)"
+        category: "tipo_cambio"
+      - id: "PN00015MM"
+        name: "Tasa de Referencia BCRP"
+        category: "tasas"
+      - id: "PN01207PM"
+        name: "Balanza Comercial (millones US$)"
+        category: "comercio_exterior"
+    api_pattern: "{base_url}/{series_id}/{format}/{start_period}/{end_period}"
+    bronze_container: "bcrp-raw"
+    cosmos_collection: "bcrp_indicators"
+
+  # -------------------------------------------------------------------------
+  # 2. DATOS DEMOGRAFICOS Y DESARROLLO - World Bank
+  # -------------------------------------------------------------------------
+  worldbank_peru:
+    name: "Indicadores World Bank Peru"
+    source: "World Bank Open Data"
+    base_url: "https://api.worldbank.org/v2"
+    format: "json"
+    frequency: "yearly"
+    country_code: "PE"
+    description: "Indicadores de desarrollo para Peru"
+    indicators:
+      - id: "SP.POP.TOTL"
+        name: "Poblacion Total"
+        category: "demografia"
+      - id: "NY.GDP.MKTP.CD"
+        name: "PBI (US$ corrientes)"
+        category: "economia"
+      - id: "NY.GDP.PCAP.CD"
+        name: "PBI per capita (US$ corrientes)"
+        category: "economia"
+      - id: "FP.CPI.TOTL.ZG"
+        name: "Inflacion (% anual)"
+        category: "precios"
+      - id: "SI.POV.NAHC"
+        name: "Tasa de Pobreza Nacional (%)"
+        category: "social"
+      - id: "SE.ADT.LITR.ZS"
+        name: "Tasa de Alfabetizacion Adultos (%)"
+        category: "educacion"
+      - id: "SH.XPD.CHEX.PC.CD"
+        name: "Gasto en Salud per capita (US$)"
+        category: "salud"
+      - id: "SL.UEM.TOTL.ZS"
+        name: "Tasa de Desempleo (%)"
+        category: "empleo"
+      - id: "BX.KLT.DINV.CD.WD"
+        name: "Inversion Extranjera Directa (US$)"
+        category: "inversion"
+      - id: "NE.EXP.GNFS.ZS"
+        name: "Exportaciones (% del PBI)"
+        category: "comercio"
+    api_pattern: "{base_url}/country/{country_code}/indicator/{indicator_id}?format=json&per_page=100&date=2000:2025"
+    bronze_container: "worldbank-raw"
+    cosmos_collection: "worldbank_indicators"
+
+  # -------------------------------------------------------------------------
+  # 3. COMERCIO EXTERIOR - UN Comtrade
+  # -------------------------------------------------------------------------
+  comtrade_peru:
+    name: "Comercio Exterior Peru"
+    source: "UN Comtrade Database"
+    base_url: "https://comtradeapi.un.org/public/v1/preview/C/A/HS"
+    format: "json"
+    frequency: "yearly"
+    reporter_code: 604  # Peru ISO code
+    description: "Exportaciones e importaciones de Peru por producto y socio comercial"
+    flow_codes:
+      - code: "M"
+        name: "Importaciones"
+      - code: "X"
+        name: "Exportaciones"
+    top_partners:
+      - code: 156
+        name: "China"
+      - code: 842
+        name: "Estados Unidos"
+      - code: 76
+        name: "Brasil"
+      - code: 152
+        name: "Chile"
+      - code: 170
+        name: "Colombia"
+    bronze_container: "comtrade-raw"
+    cosmos_collection: "comtrade_peru"
+
+# =============================================================================
+# MEDALLION LAYER MAPPING
+# =============================================================================
+medallion:
+  bronze:
+    storage: "cosmosdb"
+    description: "Datos crudos sin transformacion"
+    retention_days: 365
+    collections:
+      - "bcrp_indicators"
+      - "worldbank_indicators"
+      - "comtrade_peru"
+
+  silver:
+    storage: "databricks_delta"
+    description: "Datos limpios y estandarizados"
+    retention_days: 730
+    tables:
+      - name: "silver_economic_indicators"
+        sources: ["bcrp_indicators", "worldbank_indicators"]
+        description: "Indicadores economicos unificados BCRP + World Bank"
+      - name: "silver_trade_data"
+        sources: ["comtrade_peru"]
+        description: "Datos de comercio exterior normalizados"
+
+  gold:
+    storage: "azure_sql"
+    description: "Datos curados para analisis"
+    tables:
+      - name: "dim_date"
+        description: "Dimension temporal"
+      - name: "dim_indicator"
+        description: "Dimension indicadores economicos"
+      - name: "dim_trade_partner"
+        description: "Dimension socios comerciales"
+      - name: "fact_economic_indicators"
+        description: "Hechos indicadores economicos"
+        grain: "indicador por mes"
+      - name: "fact_trade_yearly"
+        description: "Hechos comercio exterior"
+        grain: "producto por socio por anio"
+
+# =============================================================================
+# ENVIRONMENT CONFIGURATION
+# =============================================================================
+environments:
+  dev:
+    cosmos_throughput: 400
+    sql_sku: "Basic"
+    databricks_sku: "standard"
+    databricks_node_type: "Standard_DS3_v2"
+    databricks_min_workers: 1
+    databricks_max_workers: 2
+
+  pre:
+    cosmos_throughput: 800
+    sql_sku: "S0"
+    databricks_sku: "standard"
+    databricks_node_type: "Standard_DS3_v2"
+    databricks_min_workers: 1
+    databricks_max_workers: 4
+
+  pro:
+    cosmos_throughput: 2000
+    sql_sku: "S1"
+    databricks_sku: "premium"
+    databricks_node_type: "Standard_DS4_v2"
+    databricks_min_workers: 2
+    databricks_max_workers: 8
