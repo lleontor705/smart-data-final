@@ -1,0 +1,383 @@
+name: Deploy Databricks Notebooks
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - pre
+          - pro
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'pro') || 'dev' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get install -y jq curl
+
+      # ---------------------------------------------------------------
+      # Determine Databricks host and token per environment
+      # ---------------------------------------------------------------
+      - name: Set Databricks credentials
+        run: |
+          if [ "${{ env.ENVIRONMENT }}" == "dev" ]; then
+            echo "DBX_HOST=${{ secrets.DATABRICKS_HOST_DEV }}" >> $GITHUB_ENV
+            echo "DBX_TOKEN=${{ secrets.DATABRICKS_TOKEN_DEV }}" >> $GITHUB_ENV
+          elif [ "${{ env.ENVIRONMENT }}" == "pre" ]; then
+            echo "DBX_HOST=${{ secrets.DATABRICKS_HOST_PRE }}" >> $GITHUB_ENV
+            echo "DBX_TOKEN=${{ secrets.DATABRICKS_TOKEN_PRE }}" >> $GITHUB_ENV
+          elif [ "${{ env.ENVIRONMENT }}" == "pro" ]; then
+            echo "DBX_HOST=${{ secrets.DATABRICKS_HOST_PRO }}" >> $GITHUB_ENV
+            echo "DBX_TOKEN=${{ secrets.DATABRICKS_TOKEN_PRO }}" >> $GITHUB_ENV
+          fi
+
+      # ---------------------------------------------------------------
+      # Validate connectivity
+      # ---------------------------------------------------------------
+      - name: Validate Databricks connectivity
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X GET "https://${DBX_HOST}/api/2.0/clusters/list" \
+            -H "Authorization: Bearer ${DBX_TOKEN}")
+          if [ "$RESPONSE" != "200" ]; then
+            echo "ERROR: Cannot connect to Databricks (HTTP $RESPONSE)"
+            exit 1
+          fi
+          echo "Connected to Databricks: ${DBX_HOST}"
+
+      # ---------------------------------------------------------------
+      # Create workspace folder structure
+      # ---------------------------------------------------------------
+      - name: Create workspace directories
+        run: |
+          BASE_PATH="/smartdata/${{ env.ENVIRONMENT }}"
+          for LAYER in setup bronze silver gold; do
+            echo "Creating directory: ${BASE_PATH}/${LAYER}"
+            curl -s -X POST "https://${DBX_HOST}/api/2.0/workspace/mkdirs" \
+              -H "Authorization: Bearer ${DBX_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"path\": \"${BASE_PATH}/${LAYER}\"}" || true
+          done
+          echo "Workspace directories created"
+
+      # ---------------------------------------------------------------
+      # Deploy notebooks (Bronze, Silver, Gold)
+      # ---------------------------------------------------------------
+      - name: Deploy notebooks
+        run: |
+          BASE_PATH="/smartdata/${{ env.ENVIRONMENT }}"
+          DEPLOY_COUNT=0
+          FAIL_COUNT=0
+
+          for LAYER in setup bronze silver gold; do
+            echo "=== Deploying ${LAYER} layer ==="
+            for FILE in pipelines/databricks/${LAYER}/*.py; do
+              [ -f "$FILE" ] || continue
+              NOTEBOOK_NAME=$(basename "$FILE" .py)
+              DEST_PATH="${BASE_PATH}/${LAYER}/${NOTEBOOK_NAME}"
+
+              echo "  Uploading: ${NOTEBOOK_NAME} -> ${DEST_PATH}"
+
+              CONTENT=$(base64 -w 0 "$FILE")
+
+              RESULT=$(curl -s -w "\n%{http_code}" \
+                -X POST "https://${DBX_HOST}/api/2.0/workspace/import" \
+                -H "Authorization: Bearer ${DBX_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"path\": \"${DEST_PATH}\",
+                  \"format\": \"SOURCE\",
+                  \"language\": \"PYTHON\",
+                  \"content\": \"${CONTENT}\",
+                  \"overwrite\": true
+                }")
+
+              HTTP_CODE=$(echo "$RESULT" | tail -1)
+              BODY=$(echo "$RESULT" | head -n -1)
+
+              if [ "$HTTP_CODE" == "200" ]; then
+                echo "    -> OK"
+                DEPLOY_COUNT=$((DEPLOY_COUNT + 1))
+              else
+                echo "    -> FAILED (HTTP ${HTTP_CODE}): ${BODY}"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+              fi
+            done
+          done
+
+          echo ""
+          echo "Deployment summary: ${DEPLOY_COUNT} succeeded, ${FAIL_COUNT} failed"
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # Validate deployment
+      # ---------------------------------------------------------------
+      - name: Validate deployment
+        run: |
+          BASE_PATH="/smartdata/${{ env.ENVIRONMENT }}"
+          echo "Listing deployed notebooks:"
+          for LAYER in setup bronze silver gold; do
+            echo ""
+            echo "=== ${LAYER} ==="
+            curl -s -X GET "https://${DBX_HOST}/api/2.0/workspace/list" \
+              -H "Authorization: Bearer ${DBX_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"path\": \"${BASE_PATH}/${LAYER}\"}" | jq -r '.objects[]?.path // "  (empty)"'
+          done
+
+      # ---------------------------------------------------------------
+      # Get or identify cluster
+      # ---------------------------------------------------------------
+      - name: Get cluster ID
+        id: cluster
+        run: |
+          CLUSTER_NAME="etl-${{ env.ENVIRONMENT }}"
+          echo "Looking for cluster: ${CLUSTER_NAME}"
+
+          CLUSTERS=$(curl -s -X GET "https://${DBX_HOST}/api/2.0/clusters/list" \
+            -H "Authorization: Bearer ${DBX_TOKEN}")
+
+          CLUSTER_ID=$(echo "$CLUSTERS" | jq -r ".clusters[]? | select(.cluster_name == \"${CLUSTER_NAME}\") | .cluster_id" | head -1)
+
+          if [ -z "$CLUSTER_ID" ] || [ "$CLUSTER_ID" == "null" ]; then
+            echo "Cluster '${CLUSTER_NAME}' not found. Available clusters:"
+            echo "$CLUSTERS" | jq -r '.clusters[]?.cluster_name // "none"'
+            echo "CLUSTER_FOUND=false" >> $GITHUB_OUTPUT
+          else
+            echo "Found cluster: ${CLUSTER_ID}"
+            echo "CLUSTER_ID=${CLUSTER_ID}" >> $GITHUB_OUTPUT
+            echo "CLUSTER_FOUND=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ---------------------------------------------------------------
+      # Create and run Databricks Workflow (if cluster exists)
+      # ---------------------------------------------------------------
+      - name: Create ETL workflow
+        if: steps.cluster.outputs.CLUSTER_FOUND == 'true'
+        id: workflow
+        run: |
+          CLUSTER_ID="${{ steps.cluster.outputs.CLUSTER_ID }}"
+          BASE_PATH="/smartdata/${{ env.ENVIRONMENT }}"
+          WF_NAME="WF_smartdata_etl_${{ env.ENVIRONMENT }}"
+
+          # Delete existing workflow if present
+          EXISTING=$(curl -s -X GET "https://${DBX_HOST}/api/2.1/jobs/list?name=${WF_NAME}" \
+            -H "Authorization: Bearer ${DBX_TOKEN}")
+
+          EXISTING_ID=$(echo "$EXISTING" | jq -r '.jobs[0]?.job_id // empty')
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Deleting existing workflow: ${EXISTING_ID}"
+            curl -s -X POST "https://${DBX_HOST}/api/2.1/jobs/delete" \
+              -H "Authorization: Bearer ${DBX_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"job_id\": ${EXISTING_ID}}"
+          fi
+
+          # Create workflow with DAG
+          JOB_PAYLOAD=$(cat <<'JOBEOF'
+          {
+            "name": "WF_NAME_PLACEHOLDER",
+            "tasks": [
+              {
+                "task_key": "setup_catalog",
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/setup/00_create_catalog",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "bronze_ingest_bcrp",
+                "depends_on": [{"task_key": "setup_catalog"}],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/bronze/01_ingest_bcrp",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "bronze_ingest_worldbank",
+                "depends_on": [{"task_key": "setup_catalog"}],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/bronze/02_ingest_worldbank",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "bronze_ingest_comtrade",
+                "depends_on": [{"task_key": "setup_catalog"}],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/bronze/03_ingest_comtrade",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "silver_clean_economic",
+                "depends_on": [
+                  {"task_key": "bronze_ingest_bcrp"},
+                  {"task_key": "bronze_ingest_worldbank"}
+                ],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/silver/01_clean_economic",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "silver_clean_trade",
+                "depends_on": [
+                  {"task_key": "bronze_ingest_comtrade"}
+                ],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/silver/02_clean_trade",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "gold_dim_tables",
+                "depends_on": [
+                  {"task_key": "silver_clean_economic"},
+                  {"task_key": "silver_clean_trade"}
+                ],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/gold/01_dim_tables",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "gold_fact_tables",
+                "depends_on": [
+                  {"task_key": "gold_dim_tables"}
+                ],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/gold/02_fact_tables",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "security_grants",
+                "depends_on": [
+                  {"task_key": "gold_fact_tables"}
+                ],
+                "notebook_task": {
+                  "notebook_path": "BASE_PATH_PLACEHOLDER/setup/01_grants",
+                  "base_parameters": {"environment": "ENV_PLACEHOLDER"}
+                },
+                "existing_cluster_id": "CLUSTER_PLACEHOLDER",
+                "timeout_seconds": 600,
+                "max_retries": 1
+              }
+            ]
+          }
+          JOBEOF
+          )
+
+          # Replace placeholders
+          JOB_PAYLOAD=$(echo "$JOB_PAYLOAD" | sed "s|WF_NAME_PLACEHOLDER|${WF_NAME}|g")
+          JOB_PAYLOAD=$(echo "$JOB_PAYLOAD" | sed "s|BASE_PATH_PLACEHOLDER|${BASE_PATH}|g")
+          JOB_PAYLOAD=$(echo "$JOB_PAYLOAD" | sed "s|CLUSTER_PLACEHOLDER|${CLUSTER_ID}|g")
+          JOB_PAYLOAD=$(echo "$JOB_PAYLOAD" | sed "s|ENV_PLACEHOLDER|${{ env.ENVIRONMENT }}|g")
+
+          echo "Creating workflow: ${WF_NAME}"
+          CREATE_RESULT=$(curl -s -X POST "https://${DBX_HOST}/api/2.1/jobs/create" \
+            -H "Authorization: Bearer ${DBX_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$JOB_PAYLOAD")
+
+          JOB_ID=$(echo "$CREATE_RESULT" | jq -r '.job_id // empty')
+          if [ -z "$JOB_ID" ]; then
+            echo "ERROR creating workflow: $CREATE_RESULT"
+            exit 1
+          fi
+
+          echo "Workflow created: job_id=${JOB_ID}"
+          echo "JOB_ID=${JOB_ID}" >> $GITHUB_OUTPUT
+
+      - name: Run ETL workflow
+        if: steps.cluster.outputs.CLUSTER_FOUND == 'true' && steps.workflow.outputs.JOB_ID != ''
+        run: |
+          JOB_ID="${{ steps.workflow.outputs.JOB_ID }}"
+          echo "Starting workflow run for job_id: ${JOB_ID}"
+
+          RUN_RESULT=$(curl -s -X POST "https://${DBX_HOST}/api/2.1/jobs/run-now" \
+            -H "Authorization: Bearer ${DBX_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"job_id\": ${JOB_ID}}")
+
+          RUN_ID=$(echo "$RUN_RESULT" | jq -r '.run_id // empty')
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR starting run: $RUN_RESULT"
+            exit 1
+          fi
+
+          echo "Run started: run_id=${RUN_ID}"
+          echo "Monitor at: https://${DBX_HOST}/#job/${JOB_ID}/run/${RUN_ID}"
+
+          # Monitor execution (timeout 60 min)
+          TIMEOUT=3600
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+
+            STATUS=$(curl -s -X GET "https://${DBX_HOST}/api/2.1/jobs/runs/get?run_id=${RUN_ID}" \
+              -H "Authorization: Bearer ${DBX_TOKEN}")
+
+            LIFE_CYCLE=$(echo "$STATUS" | jq -r '.state.life_cycle_state')
+            RESULT_STATE=$(echo "$STATUS" | jq -r '.state.result_state // "RUNNING"')
+
+            echo "[${ELAPSED}s] State: ${LIFE_CYCLE} / ${RESULT_STATE}"
+
+            if [ "$LIFE_CYCLE" == "TERMINATED" ]; then
+              if [ "$RESULT_STATE" == "SUCCESS" ]; then
+                echo "Workflow completed successfully!"
+                exit 0
+              else
+                echo "Workflow failed with state: ${RESULT_STATE}"
+                echo "$STATUS" | jq '.state'
+                exit 1
+              fi
+            elif [ "$LIFE_CYCLE" == "INTERNAL_ERROR" ] || [ "$LIFE_CYCLE" == "SKIPPED" ]; then
+              echo "Workflow error: ${LIFE_CYCLE}"
+              exit 1
+            fi
+          done
+
+          echo "Timeout reached (${TIMEOUT}s)"
+          exit 1

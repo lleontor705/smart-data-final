@@ -1,0 +1,196 @@
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - 'infra/**'
+      - '.github/workflows/deploy-infra.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'infra/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - pre
+          - pro
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.6.0'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # -------------------------------------------------------------------
+  # Determine target environment
+  # -------------------------------------------------------------------
+  set-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+    steps:
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "environment=pre" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+  # -------------------------------------------------------------------
+  # Terraform Plan
+  # -------------------------------------------------------------------
+  terraform-plan:
+    needs: set-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.set-environment.outputs.environment }}
+    env:
+      TF_ENV: ${{ needs.set-environment.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=rg-tfstate" \
+            -backend-config="storage_account_name=stsmartdatatfstate" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=smartdata-${TF_ENV}.tfstate"
+
+      - name: Terraform Validate
+        working-directory: infra
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: infra
+        run: |
+          terraform plan \
+            -var-file="../config/environments/${TF_ENV}.tfvars" \
+            -out=tfplan-${TF_ENV}
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_ENV }}
+          path: infra/tfplan-${{ env.TF_ENV }}
+
+  # -------------------------------------------------------------------
+  # Terraform Apply
+  # -------------------------------------------------------------------
+  terraform-apply:
+    needs: [set-environment, terraform-plan]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.set-environment.outputs.environment }}
+    if: github.event_name != 'pull_request'
+    env:
+      TF_ENV: ${{ needs.set-environment.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_ENV }}
+          path: infra
+
+      - name: Terraform Init
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=rg-tfstate" \
+            -backend-config="storage_account_name=stsmartdatatfstate" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=smartdata-${TF_ENV}.tfstate"
+
+      - name: Terraform Apply
+        working-directory: infra
+        run: terraform apply -auto-approve tfplan-${TF_ENV}
+
+  # -------------------------------------------------------------------
+  # Deploy to Production (requires approval)
+  # -------------------------------------------------------------------
+  promote-to-pro:
+    needs: [set-environment, terraform-apply]
+    if: needs.set-environment.outputs.environment == 'pre' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: pro
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init (pro)
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=rg-tfstate" \
+            -backend-config="storage_account_name=stsmartdatatfstate" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=smartdata-pro.tfstate"
+
+      - name: Terraform Plan (pro)
+        working-directory: infra
+        run: |
+          terraform plan \
+            -var-file="../config/environments/pro.tfvars" \
+            -out=tfplan-pro
+
+      - name: Terraform Apply (pro)
+        working-directory: infra
+        run: terraform apply -auto-approve tfplan-pro
