@@ -18,8 +18,14 @@ catalog_name = f"catalog_smartdata_{environment}"
 print(f"Using catalog: {catalog_name}")
 
 # SQL Server connection from Key Vault
-jdbc_url = dbutils.secrets.get(scope="keyvault-scope", key="sql-connection-string")
-jdbc_properties = {"driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver"}
+jdbc_url = dbutils.secrets.get(scope="keyvault-scope", key="sql-jdbc-url")
+sql_user = dbutils.secrets.get(scope="keyvault-scope", key="sql-admin-user")
+sql_password = dbutils.secrets.get(scope="keyvault-scope", key="sql-admin-password")
+jdbc_properties = {
+    "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+    "user": sql_user,
+    "password": sql_password,
+}
 
 # COMMAND ----------
 
