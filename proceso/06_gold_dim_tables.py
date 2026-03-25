@@ -17,9 +17,22 @@ environment = dbutils.widgets.get("environment")
 catalog_name = f"catalog_smartdata_{environment}"
 print(f"Using catalog: {catalog_name}")
 
-# SQL Server connection from Key Vault
-jdbc_url = dbutils.secrets.get(scope="keyvault-scope", key="sql-connection-string")
-jdbc_properties = {"driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver"}
+# SQL Server connection - parse ADO.NET string from Key Vault into JDBC
+ado_conn = dbutils.secrets.get(scope="keyvault-scope", key="sql-connection-string")
+# Parse: Server=tcp:host,1433;Database=db;User ID=user;Password=pwd;...
+conn_parts = dict(p.split("=", 1) for p in ado_conn.split(";") if "=" in p)
+sql_host = conn_parts.get("Server", "").replace("tcp:", "").replace(",", ":")
+sql_db = conn_parts.get("Database", "")
+sql_user = conn_parts.get("User ID", "")
+sql_password = dbutils.secrets.get(scope="keyvault-scope", key="sql-admin-password")
+
+jdbc_url = f"jdbc:sqlserver://{sql_host};database={sql_db};encrypt=true;trustServerCertificate=false;loginTimeout=30;"
+jdbc_properties = {
+    "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+    "user": sql_user,
+    "password": sql_password,
+}
+print(f"JDBC target: {sql_host}/{sql_db}")
 
 # COMMAND ----------
 

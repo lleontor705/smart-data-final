@@ -7,6 +7,7 @@
 # COMMAND ----------
 
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 # COMMAND ----------
 
@@ -16,9 +17,20 @@ environment = dbutils.widgets.get("environment")
 catalog_name = f"catalog_smartdata_{environment}"
 print(f"Using catalog: {catalog_name}")
 
-# JDBC config for SQL Server (Gold destination)
-jdbc_url = dbutils.secrets.get(scope="keyvault-scope", key="sql-connection-string")
-jdbc_properties = {"driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver"}
+# SQL Server connection - parse ADO.NET string from Key Vault into JDBC
+ado_conn = dbutils.secrets.get(scope="keyvault-scope", key="sql-connection-string")
+conn_parts = dict(p.split("=", 1) for p in ado_conn.split(";") if "=" in p)
+sql_host = conn_parts.get("Server", "").replace("tcp:", "").replace(",", ":")
+sql_db = conn_parts.get("Database", "")
+sql_user = conn_parts.get("User ID", "")
+sql_password = dbutils.secrets.get(scope="keyvault-scope", key="sql-admin-password")
+
+jdbc_url = f"jdbc:sqlserver://{sql_host};database={sql_db};encrypt=true;trustServerCertificate=false;loginTimeout=30;"
+jdbc_properties = {
+    "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+    "user": sql_user,
+    "password": sql_password,
+}
 
 # COMMAND ----------
 
@@ -44,7 +56,7 @@ df_fact_econ = (df_econ
     # Calculate YoY change
     .withColumn("prev_year_value",
         F.lag("value_numeric", 12).over(
-            F.Window.partitionBy("indicator_key").orderBy("date_key")))
+            Window.partitionBy("indicator_key").orderBy("date_key")))
     .withColumn("yoy_change",
         F.when(F.col("prev_year_value").isNotNull() & (F.col("prev_year_value") != 0),
                ((F.col("value_numeric") - F.col("prev_year_value")) / F.abs(F.col("prev_year_value")) * 100))
@@ -91,7 +103,7 @@ df_fact_trade = (df_trade
     # YoY trade change per partner and flow
     .withColumn("prev_year_value",
         F.lag("trade_value").over(
-            F.Window.partitionBy("partner_key", "flow_code", "cmd_code").orderBy("year")))
+            Window.partitionBy("partner_key", "flow_code", "cmd_code").orderBy("year")))
     .withColumn("yoy_change_pct",
         F.when(F.col("prev_year_value").isNotNull() & (F.col("prev_year_value") != 0),
                F.round(((F.col("trade_value") - F.col("prev_year_value")) / F.col("prev_year_value") * 100), 2))
